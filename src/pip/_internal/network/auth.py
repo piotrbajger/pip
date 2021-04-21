@@ -83,8 +83,47 @@ class MultiDomainBasicAuth(AuthBase):
         # ``save_credentials`` to save these.
         self._credentials_to_save = None  # type: Optional[Credentials]
 
-    def _get_index_url(self, url):
-        # type: (str) -> Optional[str]
+        if index_urls is not None:
+            for index_url in index_urls:
+                self._cache_index_url_credentials(index_url)
+
+    def _cache_index_url_credentials(self, index_url):
+        # type: (str) -> None
+        """Find and cache credentials for an index URL.
+
+        First check if credentials are embedded in the URL. If only
+        username is present, check keyring if available.
+
+        This function will cache credentials at a index URL level,
+        rather than at a netloc level.
+        """
+        purl = urllib.parse.urlparse(index_url)
+
+        # If a local path, or URL looks invalid, do nothing
+        if purl.scheme == "file":
+            return
+        if not purl.scheme and not purl.netloc:
+            return
+
+        url_without_auth, _, auth = split_auth_netloc_from_url(index_url)
+        username, password = auth
+
+        # If both username and password embedded in the url, cache those
+        if username is not None and password is not None:
+            logger.debug("Found embedded credentials for %s", url_without_auth)
+            self.passwords[url_without_auth] = (username, password)
+            return
+
+        # If only username was present, check if we have a password
+        # stored in keyring
+        kr_auth = get_keyring_auth(url_without_auth, username)
+        if kr_auth:
+            logger.debug("Found keyring credentials for %s", url_without_auth)
+            self.passwords[url_without_auth] = kr_auth
+            return
+
+    def _get_index_url(self, url, strip_credentials=False):
+        # type: (str, bool) -> Optional[str]
         """Return the original index URL matching the requested URL.
 
         Cached or dynamically generated credentials may work against
@@ -103,13 +142,20 @@ class MultiDomainBasicAuth(AuthBase):
         for u in self.index_urls:
             prefix = remove_auth_from_url(u).rstrip("/") + "/"
             if url.startswith(prefix):
-                return u
+                if strip_credentials:
+                    return prefix.rstrip("/")
+                else:
+                    return u
         return None
 
     def _get_new_credentials(self, original_url, allow_netrc=True,
                              allow_keyring=False):
         # type: (str, bool, bool) -> AuthInfo
-        """Find and return credentials for the specified URL."""
+        """Find and return credentials for the specified URL.
+
+        This will look for the credentials in either the .netrc file,
+        or keyring.
+        """
         # Split the credentials and netloc from the url.
         url, netloc, url_user_password = split_auth_netloc_from_url(
             original_url,
@@ -147,15 +193,37 @@ class MultiDomainBasicAuth(AuthBase):
         # If we don't have a password and keyring is available, use it.
         if allow_keyring:
             # The index url is more specific than the netloc, so try it first
-            kr_auth = (
-                get_keyring_auth(index_url, username) or
-                get_keyring_auth(netloc, username)
-            )
+            index_url = self._get_index_url(url, strip_credentials=True)
+            kr_auth = get_keyring_auth(index_url, username)
+            if kr_auth:
+                logger.debug("Found credentials in keyring for %s", index_url)
+                return kr_auth
+
+            kr_auth = get_keyring_auth(netloc, username)
             if kr_auth:
                 logger.debug("Found credentials in keyring for %s", netloc)
                 return kr_auth
 
         return username, password
+
+    def _get_cached_credentials(self, original_url):
+        # type: (str) -> Tuple[Optional[str], Optional[str]]
+        """
+        Returns a cached credential associated with original_url.
+
+        If there is an associated index_url with cached credentials,
+        return those. Otherwise check cached credentials for netloc.
+        """
+        # Check index url first
+        index_url = self._get_index_url(original_url, strip_credentials=True)
+        if index_url is not None:
+            username, password = self.passwords.get(index_url, (None, None))
+            if username is not None:
+                return username, password
+
+        # Then check netloc
+        url, netloc, _ = split_auth_netloc_from_url(original_url)
+        return self.passwords.get(netloc, (None, None))
 
     def _get_url_and_credentials(self, original_url):
         # type: (str) -> Tuple[str, Optional[str], Optional[str]]
@@ -170,8 +238,12 @@ class MultiDomainBasicAuth(AuthBase):
         """
         url, netloc, _ = split_auth_netloc_from_url(original_url)
 
-        # Use any stored credentials that we have for this netloc
-        username, password = self.passwords.get(netloc, (None, None))
+        # Use any stored credentials that we have for this URL
+        username, password = self._get_cached_credentials(url)
+
+        # If found cached credentials, just return those
+        if username is not None and password is not None:
+            return url, username, password
 
         if username is None and password is None:
             # No stored credentials. Acquire new credentials without prompting
@@ -252,19 +324,24 @@ class MultiDomainBasicAuth(AuthBase):
                                                        allow_netrc=False,
                                                        allow_keyring=True)
 
+        # Deciede whether to save the new credentials at netloc or
+        # at index URL level
+        index_url = self._get_index_url(resp.url, strip_credentials=True)
+        cache_url = index_url or parsed.netloc
+
         # Prompt the user for a new username and password
         save = False
         if not username and not password:
-            username, password, save = self._prompt_for_password(parsed.netloc)
+            username, password, save = self._prompt_for_password(cache_url)
 
         # Store the new username and password to use for future requests
         self._credentials_to_save = None
         if username is not None and password is not None:
-            self.passwords[parsed.netloc] = (username, password)
+            self.passwords[cache_url] = (username, password)
 
             # Prompt to save the password to keyring
             if save and self._should_save_password_to_keyring():
-                self._credentials_to_save = (parsed.netloc, username, password)
+                self._credentials_to_save = (cache_url, username, password)
 
         # Consume content and release the original connection to allow our new
         #   request to reuse the same one.

@@ -261,8 +261,9 @@ def test_broken_keyring_disables_keyring(monkeypatch):
 
     auth = MultiDomainBasicAuth(index_urls=["http://example.com/"])
 
-    assert keyring_broken._call_count == 0
+    assert keyring_broken._call_count == 1
     for i in range(5):
+        print(f"TEST{i}")
         url = "http://example.com/path" + str(i)
         assert auth._get_new_credentials(
             url, allow_netrc=False, allow_keyring=True
